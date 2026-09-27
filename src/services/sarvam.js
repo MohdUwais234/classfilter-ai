@@ -1,15 +1,6 @@
 // services/sarvam.js
 //
 // Thin wrapper around the Sarvam AI APIs used by ClassFilter AI.
-// These are placeholder implementations wired up to real endpoints so the
-// app is ready to run the moment a key is added — swap in exact request
-// shapes from https://docs.sarvam.ai once you've confirmed them for your
-// account/plan.
-//
-// SECURITY NOTE: this app calls Sarvam directly from the browser using
-// VITE_SARVAM_API_KEY, which is fine for a hackathon demo but means the
-// key ships in the client bundle. For anything beyond a demo, proxy these
-// two calls through a small backend and keep the key server-side.
 
 const SARVAM_API_BASE = "https://api.sarvam.ai";
 
@@ -32,12 +23,7 @@ const LANGUAGE_CODE_MAP = {
 };
 
 /**
- * Transcribe a recorded/uploaded audio clip using Sarvam's Speech-to-Text
- * (Saaras / Kivi) endpoint.
- *
- * @param {Blob} audioBlob - audio captured via MediaRecorder or a dropped file
- * @param {"tanglish"|"hinglish"|"english"|"auto"} language
- * @returns {Promise<{ transcript: string }>}
+ * Transcribe a recorded/uploaded audio clip using Sarvam's Speech-to-Text endpoint.
  */
 export async function transcribeAudio(audioBlob, language = "auto") {
   const apiKey = getApiKey();
@@ -46,7 +32,7 @@ export async function transcribeAudio(audioBlob, language = "auto") {
   const form = new FormData();
   form.append("file", audioBlob, "clip.wav");
   form.append("language_code", languageCode);
-  form.append("model", "saaras:v2");
+  form.append("model", "saaras:v3"); // 👈 Updated from saaras:v2 to saaras:v3
 
   const response = await fetch(`${SARVAM_API_BASE}/speech-to-text`, {
     method: "POST",
@@ -65,31 +51,22 @@ export async function transcribeAudio(audioBlob, language = "auto") {
   return { transcript: data.transcript ?? "" };
 }
 
-// System prompt that does the actual "fluff filtering" work.
+// System prompt for academic noise filtering
 const FILTER_SYSTEM_PROMPT = `You are ClassFilter AI, a note-taking assistant for Indian university lectures.
 Given a raw, unedited lecture transcript (which may mix Tamil/Hindi and English), do the following:
 1. Strip administrative chatter (attendance, roll numbers, "silence please"), personal anecdotes, jokes, and off-topic talk (sports, gossip).
 2. Keep only academic content: definitions, explanations, formulas, and terms.
 3. Separately surface any exam hints, deadlines, or announcements.
-Return strict JSON with this shape:
+Return ONLY strict, raw JSON with this exact shape and no extra conversational text or markdown wrapping:
 {
-  "noiseFilteredPercent": number,
-  "keyConcepts": string[],
-  "formulas": [{ "name": string, "expression": string, "note": string }],
-  "examHints": [{ "level": "high"|"medium"|"low", "text": string }]
+  "noiseFilteredPercent": 60,
+  "keyConcepts": ["concept 1", "concept 2"],
+  "formulas": [{ "name": "string", "expression": "string", "note": "string" }],
+  "examHints": [{ "level": "high", "text": "string" }]
 }`;
 
 /**
- * Send a raw transcript to a Sarvam LLM chat completion and get back
- * structured, filtered lecture notes.
- *
- * @param {string} rawText
- * @returns {Promise<{
- *   noiseFilteredPercent: number,
- *   keyConcepts: string[],
- *   formulas: {name: string, expression: string, note: string}[],
- *   examHints: {level: string, text: string}[]
- * }>}
+ * Send a raw transcript to Sarvam LLM and get back structured notes.
  */
 export async function filterLecture(rawText) {
   const apiKey = getApiKey();
@@ -101,7 +78,7 @@ export async function filterLecture(rawText) {
       "api-subscription-key": apiKey,
     },
     body: JSON.stringify({
-      model: "sarvam-105b-conversations",
+      model: "sarvam-2b", // 👈 Standard Sarvam chat model name
       messages: [
         { role: "system", content: FILTER_SYSTEM_PROMPT },
         { role: "user", content: rawText },
@@ -116,6 +93,10 @@ export async function filterLecture(rawText) {
   }
 
   const data = await response.json();
-  const content = data.choices?.[0]?.message?.content ?? "{}";
+  let content = data.choices?.[0]?.message?.content ?? "{}";
+
+  // Clean markdown ```json wrapper if returned by LLM
+  content = content.replace(/```json/g, "").replace(/```/g, "").trim();
+
   return JSON.parse(content);
 }
