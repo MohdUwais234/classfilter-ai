@@ -44,19 +44,20 @@ export default function App() {
   }
 
   async function processAudio(audioBlob) {
-    // Files larger than 1MB are roughly > 30s long and require Sarvam Batch API
-    const isLongAudio = audioBlob.size > 1024 * 1024;
-
-    if (isLongAudio) {
-      setStatus("Transcribing long lecture via Sarvam Batch API (this may take a few seconds)...");
-    } else {
-      setStatus("Transcribing...");
-    }
+    const isLongAudio = audioBlob.size > 512 * 1024; // >500KB is usually > 25s
 
     try {
-      const { transcript } = isLongAudio
-        ? await transcribeLongAudio(audioBlob, language)
-        : await transcribeAudio(audioBlob, language);
+      let transcript = "";
+
+      if (isLongAudio) {
+        setStatus("Processing long lecture in parallel chunks...");
+        const result = await transcribeLongAudio(audioBlob, language, setStatus);
+        transcript = result.transcript;
+      } else {
+        setStatus("Transcribing short clip...");
+        const result = await transcribeAudio(audioBlob, language);
+        transcript = result.transcript;
+      }
 
       if (!transcript || !transcript.trim()) {
         setStatus("No speech detected in audio clip.");
@@ -64,12 +65,13 @@ export default function App() {
       }
 
       setSegments([{ text: transcript, tag: "ACADEMIC" }]);
-      setStatus("Filtering lecture content...");
+      setStatus("Filtering lecture content with Sarvam LLM...");
       const filtered = await filterLecture(transcript);
       setNotes(filtered);
       setStatus("");
     } catch (err) {
-      setStatus(err.message);
+      console.error(err);
+      setStatus(err.message || "An error occurred during processing.");
     }
   }
 

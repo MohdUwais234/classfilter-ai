@@ -1,6 +1,6 @@
 // services/sarvam.js
 //
-// Thin wrapper around the Sarvam AI APIs used by ClassFilter AI.
+// Thin wrapper around Sarvam AI APIs used by ClassFilter AI.
 
 const SARVAM_API_BASE = "https://api.sarvam.ai";
 
@@ -8,22 +8,22 @@ function getApiKey() {
   const key = import.meta.env.VITE_SARVAM_API_KEY;
   if (!key) {
     throw new Error(
-      "Missing VITE_SARVAM_API_KEY. Add it to your .env file (see .env.example)."
+      "Missing VITE_SARVAM_API_KEY. Add it to your .env file."
     );
   }
   return key;
 }
 
-// Maps the app's language selector values to Sarvam's language codes.
+// Maps language selector values to Sarvam language codes
 const LANGUAGE_CODE_MAP = {
-  tanglish: "en-IN",
-  hinglish: "en-IN",
+  tanglish: "en-IN", // English/Latin script for Tanglish
+  hinglish: "hi-IN",
   english: "en-IN",
   auto: "unknown",
 };
 
 /**
- * Transcribe a recorded/uploaded audio clip using Sarvam's Speech-to-Text endpoint.
+ * Transcribe a single audio blob (< 30s) using Sarvam STT.
  */
 export async function transcribeAudio(audioBlob, language = "auto") {
   const apiKey = getApiKey();
@@ -44,14 +44,110 @@ export async function transcribeAudio(audioBlob, language = "auto") {
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Sarvam STT request failed (${response.status}): ${errorText}`);
+    throw new Error(`Sarvam STT failed (${response.status}): ${errorText}`);
   }
 
   const data = await response.json();
   return { transcript: data.transcript ?? "" };
 }
 
-// System prompt for academic noise filtering
+/**
+ * Slices long audio into ~25 second WAV chunks and transcribes them in parallel.
+ */
+export async function transcribeLongAudio(audioBlob, language = "auto", onProgress = () => {}) {
+  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const arrayBuffer = await audioBlob.arrayBuffer();
+  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+  const duration = audioBuffer.duration;
+  const chunkSizeSeconds = 25; // 25 seconds per chunk (safe under Sarvam's 30s limit)
+  const numChunks = Math.ceil(duration / chunkSizeSeconds);
+
+  onProgress(`Chunking ${Math.round(duration)}s audio into ${numChunks} parts...`);
+
+  const chunkPromises = [];
+
+  for (let i = 0; i < numChunks; i++) {
+    const start = i * chunkSizeSeconds;
+    const end = Math.min((i + 1) * chunkSizeSeconds, duration);
+    const chunkBlob = await extractAudioChunkAsWav(audioBuffer, start, end);
+
+    // Process chunk
+    const promise = transcribeAudio(chunkBlob, language).catch((err) => {
+      console.warn(`Chunk ${i + 1} failed:`, err);
+      return { transcript: "" };
+    });
+
+    chunkPromises.push(promise);
+  }
+
+  const results = await Promise.all(chunkPromises);
+  const fullTranscript = results.map((r) => r.transcript).filter(Boolean).join(" ");
+
+  await audioContext.close();
+
+  return { transcript: fullTranscript };
+}
+
+/**
+ * Helper to encode AudioBuffer slice into WAV Blob format.
+ */
+async function extractAudioChunkAsWav(audioBuffer, startTime, endTime) {
+  const sampleRate = audioBuffer.sampleRate;
+  const startFrame = Math.floor(startTime * sampleRate);
+  const endFrame = Math.floor(endTime * sampleRate);
+  const frameLength = endFrame - startFrame;
+  const numberOfChannels = audioBuffer.numberOfChannels;
+
+  const offlineCtx = new OfflineAudioContext(numberOfChannels, frameLength, sampleRate);
+  const source = offlineCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(offlineCtx.destination);
+  source.start(0, startTime, endTime - startTime);
+
+  const renderedBuffer = await offlineCtx.startRendering();
+  return bufferToWavBlob(renderedBuffer);
+}
+
+function bufferToWavBlob(buffer) {
+  const numOfChan = buffer.numberOfChannels;
+  const length = buffer.length * numOfChan * 2 + 44;
+  const out = new DataView(new ArrayBuffer(length));
+  let channels = [], sampleRate = buffer.sampleRate, offset = 0, pos = 0;
+
+  function setUint16(data) { out.setUint16(pos, data, true); pos += 2; }
+  function setUint32(data) { out.setUint32(pos, data, true); pos += 4; }
+
+  setUint32(0x46464952); // "RIFF"
+  setUint32(length - 8);
+  setUint32(0x45564157); // "WAVE"
+  setUint32(0x20746d66); // "fmt "
+  setUint32(16);         // length
+  setUint16(1);          // raw PCM
+  setUint16(numOfChan);
+  setUint32(sampleRate);
+  setUint32(sampleRate * 2 * numOfChan);
+  setUint16(numOfChan * 2);
+  setUint16(16);
+  setUint32(0x61746164); // "data"
+  setUint32(length - pos - 4);
+
+  for (let i = 0; i < buffer.numberOfChannels; i++) channels.push(buffer.getChannelData(i));
+
+  while (pos < length) {
+    for (let i = 0; i < numOfChan; i++) {
+      let sample = Math.max(-1, Math.min(1, channels[i][offset]));
+      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0;
+      out.setInt16(pos, sample, true);
+      pos += 2;
+    }
+    offset++;
+  }
+
+  return new Blob([out], { type: "audio/wav" });
+}
+
+// Prompt for academic filtering
 const FILTER_SYSTEM_PROMPT = `You are ClassFilter AI, a note-taking assistant for Indian university lectures.
 Given a raw, unedited lecture transcript (which may mix Tamil/Hindi and English), do the following:
 1. Strip administrative chatter (attendance, roll numbers, "silence please"), personal anecdotes, jokes, and off-topic talk (sports, gossip).
@@ -66,7 +162,7 @@ Return ONLY strict, raw JSON with this exact shape and no extra conversational t
 }`;
 
 /**
- * Send a raw transcript to Sarvam LLM and get back structured notes.
+ * Filter lecture content via Sarvam LLM.
  */
 export async function filterLecture(rawText) {
   const apiKey = getApiKey();
@@ -89,72 +185,12 @@ export async function filterLecture(rawText) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Sarvam chat completion failed (${response.status}): ${errorText}`);
+    throw new Error(`Sarvam chat failed (${response.status}): ${errorText}`);
   }
 
   const data = await response.json();
   let content = data.choices?.[0]?.message?.content ?? "{}";
-
-  // Clean markdown ```json wrapper if returned by LLM
   content = content.replace(/```json/g, "").replace(/```/g, "").trim();
 
   return JSON.parse(content);
-}
-
-/**
- * Transcribe long-form audio (> 30s) using Sarvam Batch STT API.
- */
-export async function transcribeLongAudio(audioBlob, language = "auto") {
-  const apiKey = getApiKey();
-  const languageCode = LANGUAGE_CODE_MAP[language] ?? "unknown";
-
-  // Step 1: Request upload URL
-  const initRes = await fetch(`${SARVAM_API_BASE}/speech-to-text/batch/upload-url`, {
-    method: "POST",
-    headers: {
-      "api-subscription-key": apiKey,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ file_name: "lecture.mp3" })
-  });
-  
-  if (!initRes.ok) throw new Error("Failed to initialize batch upload");
-  const { upload_url, job_id } = await initRes.json();
-
-  // Step 2: Upload the audio binary
-  await fetch(upload_url, {
-    method: "PUT",
-    body: audioBlob,
-    headers: { "Content-Type": "audio/mp3" }
-  });
-
-  // Step 3: Start batch processing job
-  await fetch(`${SARVAM_API_BASE}/speech-to-text/batch`, {
-    method: "POST",
-    headers: {
-      "api-subscription-key": apiKey,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      job_id,
-      model: "saaras:v3",
-      language_code: languageCode
-    })
-  });
-
-  // Step 4: Poll job status until complete
-  while (true) {
-    await new Promise((r) => setTimeout(r, 3000)); // poll every 3s
-    const statusRes = await fetch(`${SARVAM_API_BASE}/speech-to-text/batch/${job_id}`, {
-      headers: { "api-subscription-key": apiKey }
-    });
-    const statusData = await statusRes.json();
-
-    if (statusData.status === "completed") {
-      return { transcript: statusData.results?.[0]?.transcript ?? "" };
-    }
-    if (statusData.status === "failed") {
-      throw new Error("Batch transcription failed on Sarvam servers.");
-    }
-  }
 }
