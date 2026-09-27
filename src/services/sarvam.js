@@ -16,8 +16,8 @@ function getApiKey() {
 
 // Maps the app's language selector values to Sarvam's language codes.
 const LANGUAGE_CODE_MAP = {
-  tanglish: "ta-IN",
-  hinglish: "hi-IN",
+  tanglish: "en-IN",
+  hinglish: "en-IN",
   english: "en-IN",
   auto: "unknown",
 };
@@ -32,7 +32,7 @@ export async function transcribeAudio(audioBlob, language = "auto") {
   const form = new FormData();
   form.append("file", audioBlob, "clip.wav");
   form.append("language_code", languageCode);
-  form.append("model", "saaras:v3"); // 👈 Updated from saaras:v2 to saaras:v3
+  form.append("model", "saaras:v3");
 
   const response = await fetch(`${SARVAM_API_BASE}/speech-to-text`, {
     method: "POST",
@@ -78,7 +78,7 @@ export async function filterLecture(rawText) {
       "api-subscription-key": apiKey,
     },
     body: JSON.stringify({
-      model: "sarvam-2b", // 👈 Standard Sarvam chat model name
+      model: "sarvam-105b-conversations",
       messages: [
         { role: "system", content: FILTER_SYSTEM_PROMPT },
         { role: "user", content: rawText },
@@ -99,4 +99,62 @@ export async function filterLecture(rawText) {
   content = content.replace(/```json/g, "").replace(/```/g, "").trim();
 
   return JSON.parse(content);
+}
+
+/**
+ * Transcribe long-form audio (> 30s) using Sarvam Batch STT API.
+ */
+export async function transcribeLongAudio(audioBlob, language = "auto") {
+  const apiKey = getApiKey();
+  const languageCode = LANGUAGE_CODE_MAP[language] ?? "unknown";
+
+  // Step 1: Request upload URL
+  const initRes = await fetch(`${SARVAM_API_BASE}/speech-to-text/batch/upload-url`, {
+    method: "POST",
+    headers: {
+      "api-subscription-key": apiKey,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ file_name: "lecture.mp3" })
+  });
+  
+  if (!initRes.ok) throw new Error("Failed to initialize batch upload");
+  const { upload_url, job_id } = await initRes.json();
+
+  // Step 2: Upload the audio binary
+  await fetch(upload_url, {
+    method: "PUT",
+    body: audioBlob,
+    headers: { "Content-Type": "audio/mp3" }
+  });
+
+  // Step 3: Start batch processing job
+  await fetch(`${SARVAM_API_BASE}/speech-to-text/batch`, {
+    method: "POST",
+    headers: {
+      "api-subscription-key": apiKey,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      job_id,
+      model: "saaras:v3",
+      language_code: languageCode
+    })
+  });
+
+  // Step 4: Poll job status until complete
+  while (true) {
+    await new Promise((r) => setTimeout(r, 3000)); // poll every 3s
+    const statusRes = await fetch(`${SARVAM_API_BASE}/speech-to-text/batch/${job_id}`, {
+      headers: { "api-subscription-key": apiKey }
+    });
+    const statusData = await statusRes.json();
+
+    if (statusData.status === "completed") {
+      return { transcript: statusData.results?.[0]?.transcript ?? "" };
+    }
+    if (statusData.status === "failed") {
+      throw new Error("Batch transcription failed on Sarvam servers.");
+    }
+  }
 }
