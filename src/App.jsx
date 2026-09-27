@@ -58,6 +58,11 @@ export default function App() {
         ? await transcribeLongAudio(audioBlob, language)
         : await transcribeAudio(audioBlob, language);
 
+      if (!transcript || !transcript.trim()) {
+        setStatus("No speech detected in audio clip.");
+        return;
+      }
+
       setSegments([{ text: transcript, tag: "ACADEMIC" }]);
       setStatus("Filtering lecture content...");
       const filtered = await filterLecture(transcript);
