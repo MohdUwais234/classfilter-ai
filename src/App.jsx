@@ -3,7 +3,7 @@ import RecordPanel from "./components/RecordPanel.jsx";
 import TranscriptFeed from "./components/TranscriptFeed.jsx";
 import StatBar from "./components/StatBar.jsx";
 import NotesDashboard from "./components/NotesDashboard.jsx";
-import { transcribeAudio, filterLecture } from "./services/sarvam.js";
+import { transcribeAudio, transcribeLongAudio, filterLecture } from "./services/sarvam.js";
 import { SAMPLE_RAW_SEGMENTS, SAMPLE_FILTERED_NOTES } from "./mockData.js";
 
 export default function App() {
@@ -44,9 +44,20 @@ export default function App() {
   }
 
   async function processAudio(audioBlob) {
-    setStatus("Transcribing...");
+    // Files larger than 1MB are roughly > 30s long and require Sarvam Batch API
+    const isLongAudio = audioBlob.size > 1024 * 1024;
+
+    if (isLongAudio) {
+      setStatus("Transcribing long lecture via Sarvam Batch API (this may take a few seconds)...");
+    } else {
+      setStatus("Transcribing...");
+    }
+
     try {
-      const { transcript } = await transcribeAudio(audioBlob, language);
+      const { transcript } = isLongAudio
+        ? await transcribeLongAudio(audioBlob, language)
+        : await transcribeAudio(audioBlob, language);
+
       setSegments([{ text: transcript, tag: "ACADEMIC" }]);
       setStatus("Filtering lecture content...");
       const filtered = await filterLecture(transcript);
